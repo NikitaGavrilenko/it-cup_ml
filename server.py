@@ -42,15 +42,37 @@ manager = ConnectionManager()
 
 
 async def extract_entities(text: str) -> dict:
-    """Анализ текста с помощью LLM"""
-    prompt = f"""Извлеки сущности из требования:
+    """Анализ текста с помощью LLM с улучшенным промптом"""
+    prompt = f"""Ты системный аналитик. Извлеки сущности из требования строго в JSON-формате:
+
     Текст: "{text}"
-    Формат JSON: {{"actor":"","action":"","object":"","result":""}}
-    Пример: "Система должна логировать ошибки" → {{"actor":"Система","action":"логировать","object":"ошибки","result":"отслеживание проблем"}}"""
+
+    Требуемый формат (ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ):
+    {{
+        "actor": "кто выполняет действие (1-3 слова)",
+        "action": "что делает (глагол + дополнение)",
+        "object": "над чем выполняется действие (2-4 слова)",
+        "result": "ожидаемый результат (3-5 слов)"
+    }}
+
+    Пример для "Система должна автоматически архивировать логи старше 30 дней":
+    {{
+        "actor": "Система",
+        "action": "архивировать логи",
+        "object": "логи старше 30 дней",
+        "result": "освобождение места на диске"
+    }}
+
+    Твой анализ (ТОЛЬКО JSON ФОРМАТ!):"""
 
     try:
         response = await llm.ainvoke(prompt)
-        return json.loads(response)
+        # Чистим ответ от возможных некорректных символов
+        cleaned_response = response.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        print(f"Не удалось распарсить ответ LLM: {response}")
+        return fallback_parser(text)
     except Exception as e:
         print(f"LLM Error: {e}")
         return fallback_parser(text)
