@@ -1,51 +1,60 @@
 import websockets
 import asyncio
 import json
+import pyaudio
+import base64
 
+async def send_text(ws, text):
+    await ws.send(json.dumps({
+        "type": "text",
+        "content": text
+    }))
+    response = await ws.recv()
+    print("\nРезультат анализа текста:")
+    print(json.dumps(json.loads(response), indent=2, ensure_ascii=False))
 
-async def test_client():
-    test_requirements = [
-        "Система должна автоматически создавать резервные копии баз данных каждые 24 часа",
-        "Администратор должен иметь возможность просматривать историю изменений всех документов",
-        "Пользователь может отменять последнее действие в течение 5 минут после его выполнения",
-        "Модуль отчетов должен генерировать PDF-документы по шаблону"
-    ]
+async def send_audio(ws):
+    p = pyaudio.PyAudio()
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=16000,
+        input=True,
+        frames_per_buffer=1024
+    )
 
-    try:
-        # Устанавливаем таймаут через asyncio.wait_for
-        async with websockets.connect("ws://localhost:8000/ws") as ws:
-            print("Тестирование извлечения сущностей...\n")
+    print("Запись аудио (5 секунд)...")
+    frames = []
+    for _ in range(0, int(16000 / 1024 * 5)):
+        data = stream.read(1024)
+        frames.append(data)
+    stream.stop_stream()
+    stream.close()
 
-            for req in test_requirements:
-                print(f"Отправка требования: {req}")
-                await ws.send(req)  # Отправляем требование
+    audio_bytes = b"".join(frames)
+    await ws.send(json.dumps({
+        "type": "audio",
+        "content": base64.b64encode(audio_bytes).decode("latin1")
+    }))
+    response = await ws.recv()
+    print("\nРезультат анализа аудио:")
+    print(json.dumps(json.loads(response), indent=2, ensure_ascii=False))
 
-                # Получаем ответ с таймаутом
-                try:
-                    response = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                    entities = json.loads(response)
+async def main():
+    async with websockets.connect("ws://localhost:8000/ws") as ws:
+        while True:
+            print("\n1. Анализ текста")
+            print("2. Анализ аудио")
+            print("3. Выход")
+            choice = input("Выберите действие: ")
 
-                    print("\nИзвлечённые сущности:")
-                    print(f"- Актор: {entities['actor']}")
-                    print(f"- Действие: {entities['action']}")
-                    print(f"- Объект: {entities['object']}")
-                    print(f"- Результат: {entities['result']}\n")
-
-                    await asyncio.sleep(1)  # Пауза между запросами
-
-                except asyncio.TimeoutError:
-                    print("Таймаут при ожидании ответа от сервера")
-                    continue
-
-    except websockets.exceptions.ConnectionClosedError:
-        print("Соединение было закрыто сервером")
-    except websockets.exceptions.InvalidURI:
-        print("Неверный URL сервера")
-    except websockets.exceptions.WebSocketException as e:
-        print(f"Ошибка WebSocket: {str(e)}")
-    except Exception as e:
-        print(f"Неожиданная ошибка: {str(e)}")
-
+            if choice == "1":
+                text = input("Введите требование: ")
+                await send_text(ws, text)
+            elif choice == "2":
+                await send_audio(ws)
+            elif choice == "3":
+                break
 
 if __name__ == "__main__":
-    asyncio.run(test_client())
+    asyncio.run(main())
