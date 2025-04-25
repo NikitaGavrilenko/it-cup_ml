@@ -1,151 +1,116 @@
-import os
-import json
-import uuid
-from datetime import datetime
-from pathlib import Path
-import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-import speech_recognition as sr
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any
+import logging
+import uvicorn
+from natasha import Doc, Segmenter, MorphVocab, NewsEmbedding, NewsMorphTagger
 from langchain_ollama import OllamaLLM
+import time
+
+# Настройка логгирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Конфигурация
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-MODEL_NAME = "llama3"  # Измените при необходимости
-SAMPLE_RATE = 16000
-CHUNK_SIZE = 1024
+# Инициализация NLP
+try:
+    logger.info("Инициализация NLP...")
+    segmenter = Segmenter()
+    morph_vocab = MorphVocab()
+    emb = NewsEmbedding()
+    morph_tagger = NewsMorphTagger(emb)
 
-# Инициализация
-recognizer = sr.Recognizer()
-llm = OllamaLLM(model=MODEL_NAME)
+    # Тестовая обработка
+    test_doc = Doc("тест")
+    test_doc.segment(segmenter)
+    test_doc.tag_morph(morph_tagger)
+    logger.info("NLP модели успешно загружены")
+except Exception as e:
+    logger.error(f"Ошибка инициализации NLP: {e}")
+    raise
+
+# Инициализация LLM
+try:
+    logger.info("Инициализация LLM...")
+    llm = OllamaLLM(
+        model="mistral",
+        base_url="http://localhost:11434",
+        timeout=300  # Увеличенный таймаут
+    )
+    # Тестовый запрос
+    test_response = llm.invoke("Тест")[:50]
+    logger.info(f"LLM подключена: {test_response}...")
+except Exception as e:
+    logger.error(f"Ошибка подключения LLM: {e}")
+    raise
 
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections = {}
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        session_id = str(uuid.uuid4())
-        self.active_connections[session_id] = websocket
-        return session_id
-
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
+class Request(BaseModel):
+    text: str
+    command: str = "parse"
 
 
-manager = ConnectionManager()
+class Response(BaseModel):
+    status: str
+    data: Dict[str, Any] = {}
+    processing_time: float
 
 
-async def extract_entities(text: str) -> dict:
-    """Анализ текста с помощью LLM с улучшенным промптом"""
-    prompt = f"""Ты системный аналитик. Извлеки сущности из требования строго в JSON-формате:
-
-    Текст: "{text}"
-
-    Требуемый формат (ВСЕ ПОЛЯ ОБЯЗАТЕЛЬНЫ):
-    {{
-        "actor": "кто выполняет действие (1-3 слова)",
-        "action": "что делает (глагол + дополнение)",
-        "object": "над чем выполняется действие (2-4 слова)",
-        "result": "ожидаемый результат (3-5 слов)"
-    }}
-
-    Пример для "Система должна автоматически архивировать логи старше 30 дней":
-    {{
-        "actor": "Система",
-        "action": "архивировать логи",
-        "object": "логи старше 30 дней",
-        "result": "освобождение места на диске"
-    }}
-
-    Твой анализ (ТОЛЬКО JSON ФОРМАТ!):"""
-
+@app.post("/api/process")
+async def process_text(request: Request):
+    start_time = time.time()
     try:
-        response = await llm.ainvoke(prompt)
-        # Чистим ответ от возможных некорректных символов
-        cleaned_response = response.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_response)
-    except json.JSONDecodeError:
-        print(f"Не удалось распарсить ответ LLM: {response}")
-        return fallback_parser(text)
+        logger.info(f"Обработка запроса: {request.command}")
+
+        if not request.text.strip():
+            raise HTTPException(400, "Пустой текст")
+
+        # NLP анализ
+        doc = Doc(request.text)
+        doc.segment(segmenter)
+        doc.tag_morph(morph_tagger)
+
+        nlp_result = {
+            "actors": [t.text for t in doc.tokens if t.pos == "PROPN"],
+            "actions": [t.text for t in doc.tokens if t.pos == "VERB"],
+            "objects": [t.text for t in doc.tokens if t.pos == "NOUN"]
+        }
+
+        # LLM обработка
+        if request.command == "voice":
+            prompt = f"""Разбери текст на структуру:
+            АКТОР|ДЕЙСТВИЕ|ОБЪЕКТ|РЕЗУЛЬТАТ
+            Текст: {request.text}"""
+            llm_response = llm.invoke(prompt)
+
+            result = {
+                "nlp": nlp_result,
+                "llm": llm_response,
+                "source": "voice"
+            }
+        else:
+            result = {"nlp": nlp_result}
+
+        return Response(
+            status="success",
+            data=result,
+            processing_time=time.time() - start_time
+        )
+
     except Exception as e:
-        print(f"LLM Error: {e}")
-        return fallback_parser(text)
-
-
-def fallback_parser(text: str) -> dict:
-    """Резервный парсер"""
-    words = text.split()
-    return {
-        "actor": words[0] if words else "Система",
-        "action": " ".join(words[1:3]) if len(words) > 2 else "не определено",
-        "object": " ".join(words[3:]) if len(words) > 3 else "не определено",
-        "result": text.split(".")[0],
-        "is_fallback": True
-    }
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    session_id = await manager.connect(websocket)
-    try:
-        while True:
-            # Получаем данные от клиента
-            data = await websocket.receive_json()
-
-            if data["type"] == "text":
-                # Текстовый анализ
-                text = data["content"]
-                entities = await extract_entities(text)
-                await websocket.send_json({
-                    "type": "analysis_result",
-                    "text": text,
-                    "entities": entities,
-                    "timestamp": datetime.now().isoformat()
-                })
-
-            elif data["type"] == "audio":
-                # Обработка аудио
-                audio_data = bytes(data["content"], "latin1")
-                audio_path = UPLOAD_DIR / f"{session_id}.wav"
-
-                with open(audio_path, "wb") as f:
-                    f.write(audio_data)
-
-                with sr.AudioFile(str(audio_path)) as source:
-                    audio = recognizer.record(source)
-                    text = recognizer.recognize_google(audio, language="ru-RU")
-                    os.remove(audio_path)
-
-                entities = await extract_entities(text)
-                await websocket.send_json({
-                    "type": "audio_result",
-                    "text": text,
-                    "entities": entities,
-                    "timestamp": datetime.now().isoformat()
-                })
-
-    except WebSocketDisconnect:
-        manager.disconnect(session_id)
-    except Exception as e:
-        print(f"Error: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "OK", "model": MODEL_NAME}
+        logger.error(f"Ошибка обработки: {e}")
+        raise HTTPException(500, str(e))
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        timeout_keep_alive=600,
+        log_level="info"
+    )
